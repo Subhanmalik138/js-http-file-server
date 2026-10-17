@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { lookupMime } from './mime.js';
 import { renderDirectoryListing } from './listing.js';
+import { checkAuth } from './auth.js';
 import { resolvePath, parseRange, makeEtag } from './http-utils.js';
 
 const sendError = (res, status, message) => {
@@ -92,10 +93,71 @@ async function serveDirectory(req, res, pathname, dirPath, url) {
   res.end(html);
 }
 
+/**
+ * Upload a file via PUT. Streams the request body straight to disk (no
+ * buffering), refuses to overwrite directories, and caps uploads at 1 GiB.
+ */
+const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024;
+
+async function handleUpload(req, res, options, pathname) {
+  if (!options.upload) return sendError(res, 403, 'Uploads are disabled (restart with --upload)');
+
+  let filePath;
+  try {
+    filePath = resolvePath(options.root, pathname);
+  } catch (err) {
+    return sendError(res, err.status ?? 400, err.message);
+  }
+  if (filePath === null) return sendError(res, 403, 'Forbidden');
+  if (pathname.endsWith('/')) return sendError(res, 400, 'Upload target must be a file path');
+
+  const length = Number(req.headers['content-length']);
+  if (Number.isFinite(length) && length > MAX_UPLOAD_BYTES) {
+    return sendError(res, 413, 'Upload too large');
+  }
+
+  try {
+    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+    const existing = await fs.promises.stat(filePath).catch(() => null);
+    if (existing?.isDirectory()) return sendError(res, 400, 'Upload target is a directory');
+
+    let received = 0;
+    const out = fs.createWriteStream(filePath);
+    await new Promise((resolve, reject) => {
+      req.on('data', (chunk) => {
+        received += chunk.length;
+        if (received > MAX_UPLOAD_BYTES) {
+          req.destroy();
+          out.destroy();
+          reject(Object.assign(new Error('Upload too large'), { status: 413 }));
+        }
+      });
+      req.pipe(out);
+      out.on('finish', resolve);
+      out.on('error', reject);
+      req.on('error', reject);
+    });
+    res.writeHead(existing ? 200 : 201, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(`Stored ${received} bytes\n`);
+  } catch (err) {
+    sendError(res, err.status ?? 500, err.message || 'Upload failed');
+  }
+}
+
 function handleRequest(options) {
   return async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const pathname = url.pathname;
+
+    // Basic auth applies to every route when configured.
+    if (!checkAuth(req, options.auth)) {
+      res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="fileserve"' });
+      return res.end('Authentication required\n');
+    }
+
+    if (req.method === 'PUT') {
+      return handleUpload(req, res, options, pathname);
+    }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       return sendError(res, 405, 'Method Not Allowed');
