@@ -1,0 +1,1 @@
+{"bin":{"fileserve":"./bin/fileserve.js"},"description":"Zero-dependency Node.js HTTP file server: static files, directory listing, range requests, uploads, basic auth","engines":{"node":">=18"},"license":"MIT","main":"src/server.js","name":"js-http-file-server","scripts":{"start":"node bin/fileserve.js","test":"node --test tests/"},"type":"module","version":"1.0.0"}
