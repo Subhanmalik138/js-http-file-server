@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { lookupMime } from './mime.js';
+import { renderDirectoryListing } from './listing.js';
 import { resolvePath, parseRange, makeEtag } from './http-utils.js';
 
 const sendError = (res, status, message) => {
@@ -58,6 +59,39 @@ async function serveFile(req, res, filePath, stat) {
   fs.createReadStream(filePath).pipe(res);
 }
 
+/**
+ * Render and serve a directory listing. Hidden files (dotfiles) are skipped,
+ * and symlinks are resolved — dangling ones are skipped rather than served.
+ */
+async function serveDirectory(req, res, pathname, dirPath, url) {
+  let names;
+  try {
+    names = await fs.promises.readdir(dirPath);
+  } catch {
+    return sendError(res, 403, 'Cannot read directory');
+  }
+  const entries = [];
+  for (const name of names) {
+    if (name.startsWith('.')) continue;
+    let stat;
+    try {
+      stat = await fs.promises.stat(path.join(dirPath, name));
+    } catch {
+      continue;
+    }
+    entries.push({
+      name,
+      isDirectory: stat.isDirectory(),
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+    });
+  }
+  const html = renderDirectoryListing(pathname, entries, url.searchParams.get('sort') ?? 'name');
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(html) });
+  if (req.method === 'HEAD') return res.end();
+  res.end(html);
+}
+
 function handleRequest(options) {
   return async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -87,15 +121,14 @@ function handleRequest(options) {
         res.writeHead(301, { Location: pathname + '/' });
         return res.end();
       }
-      // Stage 2: directory listing. For now serve index.html if present.
       const index = path.join(filePath, 'index.html');
       try {
         const indexStat = await fs.promises.stat(index);
         if (indexStat.isFile()) return serveFile(req, res, index, indexStat);
       } catch {
-        /* fall through */
+        /* fall through to the listing */
       }
-      return sendError(res, 404, 'No index.html (directory listing coming in stage 2)');
+      return serveDirectory(req, res, pathname, filePath, url);
     }
 
     if (!stat.isFile()) return sendError(res, 404, 'Not Found');
